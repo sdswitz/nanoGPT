@@ -15,6 +15,12 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# === GNN support ===
+try:
+    import torch_geometric.nn as pyg_nn
+except ImportError:
+    pyg_nn = None
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -105,6 +111,32 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+class GraphBlock(nn.Module):
+    """1‑hop message passing (GATv2) + residual LN + MLP."""
+    def __init__(self, n_embd, heads=8, dropout=0.1):
+        super().__init__()
+        assert pyg_nn is not None, "pip install torch_geometric"
+        self.conv = pyg_nn.GATv2Conv(
+            in_channels=n_embd,
+            out_channels=n_embd // heads,
+            heads=heads,
+            dropout=dropout,
+            concat=True,
+        )
+        self.ln = LayerNorm(n_embd, bias=False)
+        self.ff = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd, bias=False),
+            nn.GELU(),
+            nn.Linear(4 * n_embd, n_embd, bias=False),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, edge_index):
+        h = self.conv(x, edge_index)
+        x = x + self.ln(h)
+        x = x + self.ff(x)
+        return x
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -114,6 +146,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    n_front: int = 6   # transformer layers before the GNN
+    n_graph: int = 2   # number of GraphBlocks
 
 class GPT(nn.Module):
 
@@ -123,6 +157,9 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        self.n_front = getattr(config, 'n_front', 6)
+        self.n_graph = getattr(config, 'n_graph', 2)
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -131,20 +168,18 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight # weight tying
 
-        # init all weights
+        if self.n_graph:
+            self.graph_blocks = nn.ModuleList([
+                GraphBlock(config.n_embd, heads=config.n_head, dropout=config.dropout)
+                for _ in range(self.n_graph)
+            ])
+
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
-        # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
@@ -167,7 +202,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, edge_index=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -177,19 +212,27 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        # 1) Early transformer
+        for blk in self.transformer.h[:self.n_front]:
+            x = blk(x)
+        # 2) Graph reasoning (flatten to nodes)
+        if self.n_graph:
+            B, T, C = x.shape
+            g = x.view(B * T, C)
+            for gb in self.graph_blocks:
+                g = gb(g, edge_index)
+            x = g.view(B, T, C)
+        # 3) Remaining transformer
+        for blk in self.transformer.h[self.n_front:]:
+            x = blk(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
-
         return logits, loss
 
     def crop_block_size(self, block_size):

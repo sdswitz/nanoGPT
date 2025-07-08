@@ -201,6 +201,16 @@ For simple model benchmarking and profiling, `bench.py` might be useful. It's id
 
 Note that the code by default uses [PyTorch 2.0](https://pytorch.org/get-started/pytorch-2.0/). At the time of writing (Dec 29, 2022) this makes `torch.compile()` available in the nightly release. The improvement from the one line of code is noticeable, e.g. cutting down iteration time from ~250ms / iter to 135ms / iter. Nice work PyTorch team!
 
+## Graph Neural Network (GNN) Integration
+
+nanoGPT now supports optional Graph Neural Network (GNN) layers (GATv2) between transformer blocks for improved relational reasoning. To use, install [torch-geometric](https://pytorch-geometric.readthedocs.io/) and see `config/train_gpt2_gnn.py` for an example config.
+
+```
+pip install torch-geometric
+```
+
+See the design doc in `docs/` for details.
+
 ## todos
 
 - Investigate and add FSDP instead of DDP
