@@ -15,14 +15,17 @@ wandb_run_name = 'mini-gpt'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
-batch_size = 64
-block_size = 256 # context of up to 256 previous characters
+batch_size = 16
+block_size = 128 # context of up to 256 previous characters
 
 # baby GPT model :)
 n_layer = 6
 n_head = 6
 n_embd = 384
 dropout = 0.2
+
+gnn_after_layer = 3  # Insert GNN after the 3rd layer (0-indexed); adjust based on n_layer
+gnn_threshold = 0.5  # Cosine similarity threshold for edges; tune as needed
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
 max_iters = 5000
